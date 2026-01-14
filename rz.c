@@ -85,12 +85,20 @@ ZRESULT zm_send(uint8_t chr) {
     return OK;
 }
 
-void InitUartCustom(uint32_t baud) {
-    // F_CPU is defined in your Makefile as 28636360UL
-    uint16_t baud_setting = (F_CPU / (16 * baud)) - 1;
-    UBRR0H = (uint8_t)(baud_setting >> 8);
-    UBRR0L = (uint8_t)baud_setting;
-    UCSR0B |= (1 << RXEN0) | (1 << TXEN0);
+void InitUartCustom(uint32_t baud_idx) {
+    // The Uzebox kernel usually expects the divider, not the raw baud.
+    // Using the example's known-good table is safer:
+    const u16 bauds[] = {11931, 2982, 1490, 745, 372, 185, 92, 61, 30}; 
+    u16 baud_divider = bauds[7]; // index 7 is 57600
+    
+    UBRR0H = (uint8_t)(baud_divider >> 8);
+    UBRR0L = (uint8_t)(baud_divider & 0xff);
+    
+    UCSR0A = (1 << U2X0);
+    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00); // 8-bit, no parity, 1 stop
+    UCSR0B = (1 << RXEN0) | (1 << TXEN0);   // Enable RX and TX
+    
+    InitUartRxBuffer();
 }
 
 void UpdateProgress(uint32_t received, char* filename) {
@@ -111,8 +119,11 @@ void UpdateProgress(uint32_t received, char* filename) {
 }
 
 int main(void) {
-    // For pf_write to work, we need a 'written' variable
+    // Variables for Petit FatFs
     UINT written;
+    FRESULT res;
+    
+    // Variables for Zmodem
     uint8_t rzr_buf[4];
     uint8_t data_buf[DATA_BUF_LEN];
     uint16_t count;
@@ -120,28 +131,43 @@ int main(void) {
     ZHDR hdr;
     bool file_open = false;
 
-    // 1. Initialize the Kernel (Setup timers/interrupts)
-    InitMusicPlayer(NULL);
+    // 1. Initialize the Uzebox Kernel
+    InitMusicPlayer(NULL); 
+
+    // 2. Setup UART for 57600 Baud (Double Speed Mode)
+    // Using the verified divider table from the Uzesynth demo
+    // bauds[7] corresponds to 57600 at Uzebox clock speeds
+    const u16 bauds[] = {11931, 2982, 1490, 745, 372, 185, 92, 61, 30}; 
+    u16 baud_divider = bauds[7]; 
+    
+    UBRR0H = (uint8_t)(baud_divider >> 8);
+    UBRR0L = (uint8_t)(baud_divider & 0xff);
+    UCSR0A = (1 << U2X0);                       // Double Speed is critical for 57600
+    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);     // 8-bit frame, 1 stop bit
+    UCSR0B = (1 << RXEN0) | (1 << TXEN0);       // Enable both RX and TX
+    
+    InitUartRxBuffer();                         // Initialize Kernel's ring buffer pointers
 
     while (1) {
-        // Clear screen and reset state for a new session
+        // Reset screen and state for a fresh session
         ClearVram();
         received_data_size = 0;
         file_open = false;
 
+        // Use lowercase strings for the Video Mode 80 font
         Print(0, 0, PSTR("uzebox zmodem receiver"));
-        Print(0, 2, PSTR("awaiting zmodem sender"));
+        Print(0, 2, PSTR("awaiting zmodem sender..."));
 
-        // 2. Initialize SD Card (Attempt mount every loop in case card was swapped)
+        // 3. Mount SD Card
         if(pf_mount(&fs) != FR_OK) {
             Print(0, 4, PSTR("sd card mount failed!"));
-            WaitVsync(60); // Wait 1 second before retrying
+            WaitVsync(60); 
             continue;
         }
 
-        // 3. Wait for "rz\r" handshake from PC
+        // 4. Wait for Handshake (PC sending 'rz\r')
         if (zm_await("rz\r", (char*)rzr_buf, 4) == OK) {
-            Print(0, 2, PSTR("handshake ok! negotiating..."));
+            Print(0, 2, PSTR("handshake ok! negotiating...   "));
 
             while (true) {
                 uint16_t result = zm_await_header(&hdr);
@@ -149,6 +175,7 @@ int main(void) {
                 if (result == OK) {
                     switch (hdr.type) {
                         case ZRQINIT:
+                            // PC wants to start; tell them we can handle CRC and Overlap
                             zm_send_flags_hdr(ZRINIT, CANOVIO, 0, 0, 0);
                             break;
 
@@ -156,7 +183,7 @@ int main(void) {
                             count = DATA_BUF_LEN;
                             zm_read_data_block(data_buf, &count);
 
-                            // Open the pre-existing container file
+                            // Petit FatFs: upload.bin must already exist on SD
                             if(pf_open("UPLOAD.BIN") == FR_OK) {
                                 Print(0, 3, PSTR("receiving: "));
                                 Print(11, 3, (char*)data_buf);
@@ -165,35 +192,34 @@ int main(void) {
                                 zm_send_pos_hdr(ZRPOS, 0);
                             } else {
                                 Print(0, 3, PSTR("error: upload.bin not found"));
-                                // Force exit this session
                                 goto session_end;
                             }
                             break;
 
                         case ZDATA:
                             while (file_open) {
-                                // Give the kernel a moment to process video interrupts
-                                WaitVsync(1);
-
+                                WaitVsync(1); // Keep video signal stable during transfer
+                                
                                 count = DATA_BUF_LEN;
                                 result = zm_read_data_block(data_buf, &count);
 
                                 if (!IS_ERROR(result)) {
-                                    // Write data block to SD
-                                    FRESULT res = pf_write(data_buf, count, &written);
+                                    res = pf_write(data_buf, count, &written);
 
                                     if(res != FR_OK) {
                                         Print(0, 5, PSTR("sd write error!"));
                                         break;
                                     }
 
-                                    received_data_size += (count);
-                                    UpdateProgress(received_data_size, "UPLOAD.BIN");
+                                    received_data_size += count;
+                                    UpdateProgress(received_data_size, "upload.bin");
 
+                                    // Acknowledge data sub-packets
                                     if (result == GOT_CRCQ || result == GOT_CRCW) {
                                         zm_send_pos_hdr(ZACK, received_data_size);
                                     }
                                 } else {
+                                    // Error in block, request re-send from last good position
                                     zm_send_pos_hdr(ZRPOS, received_data_size);
                                     break;
                                 }
@@ -201,16 +227,16 @@ int main(void) {
                             break;
 
                         case ZEOF:
-                            pf_write(0, 0, &written); // Finalize file
+                            pf_write(0, 0, &written); // Finalize the file size on SD
                             file_open = false;
-                            Print(0, 7, PSTR("transfer complete."));
+                            Print(0, 7, PSTR("transfer complete.           "));
                             zm_send_flags_hdr(ZRINIT, CANOVIO, 0, 0, 0);
                             break;
 
                         case ZFIN:
                             zm_send_pos_hdr(ZFIN, 0);
-                            Print(0, 8, PSTR("session closed."));
-                            WaitVsync(120); // Show status for 2 seconds
+                            Print(0, 8, PSTR("session closed.              "));
+                            WaitVsync(120); 
                             goto session_end;
                     }
                 } else {
@@ -218,10 +244,9 @@ int main(void) {
                 }
             }
         }
-
+        
         session_end:
-        // Short pause before the while(1) loop restarts the listener
-        WaitVsync(30);
+        WaitVsync(60); // Short pause before restarting the listener
     }
 
     return 0;
